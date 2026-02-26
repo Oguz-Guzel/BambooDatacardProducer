@@ -42,6 +42,7 @@ from numpy_hist import NumpyHist
 from IPython import embed
 
 ROOT.gROOT.SetBatch(True) 
+ROOT.gErrorIgnoreLevel = ROOT.kFatal
 
 # Inference setup #
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
