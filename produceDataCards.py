@@ -3706,8 +3706,7 @@ if __name__=="__main__":
     args = parser.parse_args()
 
     logging.basicConfig(level   = logging.DEBUG,
-                        format  = '%(asctime)s - %(levelname)s - %(message)s',
-                        datefmt = '%m/%d/%Y %H:%M:%S')
+                        format  = '%(levelname)s - %(message)s')
 
     # Verbose level #
     if not args.verbose:
