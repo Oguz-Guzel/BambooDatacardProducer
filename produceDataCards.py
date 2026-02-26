@@ -341,7 +341,7 @@ class Datacard:
             # Check if in the group list #
             groups = self.findGroup(sample)
             if len(groups) == 0:
-                logging.warning("Could not find sample %s in group list"%sample)
+                logging.warning("Could not find file %s in group list"%sample)
                 continue
             if len(groups) != len(set(groups)): # One or more groups are repeated
                 logging.error(f'Sample {f} will be present in several times in the same group :')
