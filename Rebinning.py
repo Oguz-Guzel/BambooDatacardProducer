@@ -198,6 +198,25 @@ class Rebin:
 
 
 
+
+class Half(Rebin):
+    """Merge every two consecutive bins to halve the number of bins (ceil for odd)."""
+
+    def __init__(self, h):
+        nph = self._processHist(h)
+        edges = nph.e
+        if edges.shape[0] <= 2:
+            self.ne = edges
+            return
+
+        new_edges = [edges[0]]
+        for idx in range(2, edges.shape[0], 2):
+            new_edges.append(edges[idx])
+        if new_edges[-1] != edges[-1]:
+            new_edges.append(edges[-1])
+
+        self.ne = np.array(new_edges)
+
 class Quantile(Rebin):
     """
         Applies quantile binning

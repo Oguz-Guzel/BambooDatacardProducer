@@ -1546,6 +1546,8 @@ class Datacard:
                         rebinFunc = self.rebinClassic
                     elif method == 'boundary':
                         rebinFunc = self.rebinBoundary
+                    elif method == 'half':
+                        rebinFunc = self.rebinHalf
                     elif method == 'quantile':
                         rebinFunc = self.rebinInQuantile
                     elif method == 'threshold':
@@ -1638,6 +1640,23 @@ class Datacard:
         for group in self.content[histName].keys():
             for systName,hist in self.content[histName][group].items():
                 self.content[histName][group][systName] = boundObj(hist) 
+                if logging.root.level <= 10:
+                    pbar.update()
+
+    def rebinHalf(self,histName,params):
+        """Merge every two bins into one (1D). Params are ignored."""
+
+        from Rebinning import Half
+
+        # Build binning once from the first available histogram.
+        halfObj = None
+        if logging.root.level <= 10:
+            pbar = enlighten.Counter(total=self.countPerHistName(histName), desc='Progress', unit='histograms')
+        for group in self.content[histName].keys():
+            for systName,hist in self.content[histName][group].items():
+                if halfObj is None:
+                    halfObj = Half(hist)
+                self.content[histName][group][systName] = halfObj(hist)
                 if logging.root.level <= 10:
                     pbar.update()
 
