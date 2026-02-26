@@ -26,6 +26,7 @@ import numpy as np
 from functools import partial
 import enlighten
 from contextlib import redirect_stdout
+import zlib
 import ROOT
 
 # from CP3SlurmUtils.Configuration import Configuration
