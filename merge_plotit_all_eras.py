@@ -43,8 +43,8 @@ COMBINED_CATEGORIES = [
     ("Resolved 2b", f"{PLOT_NAME_PREFIX}resolved2b"),
     ("Boosted", f"{PLOT_NAME_PREFIX}boosted"),
 ]
-COMBINED_BIN_UNIT = 1.0  # width assigned to each original bin when concatenating
-COMBINED_X_TITLE_OFFSET = 12.4  # move x-axis title downward (ROOT offset >1 goes farther)
+COMBINED_BIN_UNIT = 1.0
+COMBINED_X_TITLE_OFFSET = 12.4
 
 # Load per-era plotIt configs.
 configs = []
@@ -55,10 +55,12 @@ for era in ERAS:
         configs.append(cfg)
         configs_by_era[era] = cfg
 
-# Merge them into a single config.
-merged = Datacard.merge_plotIt(configs)
-
-
+# Era subsets to merge separately.
+ERA_GROUPS = {
+    "Run3": ERAS,
+    "2022": ["2022", "2022EE"],
+    "2023": ["2023", "2023BPix"],
+}
 def prune_non_sm_signals(cfg):
     """Drop non-SM HH signals from files and plot sample lists."""
 
@@ -80,7 +82,7 @@ def prune_non_sm_signals(cfg):
                 plot["samples"] = [s for s in samples if s not in drop_set]
 
 
-prune_non_sm_signals(merged)
+prune_non_sm_signals_dataclass = prune_non_sm_signals  # keep name for reuse in functions
 
 # Use plotIt configuration from the combined config file.
 COMBINED_CONFIG_PATH = "/afs/cern.ch/work/a/aguzel/private/wwbb-run3-datacards/config/config_combined_sr.yml"
@@ -93,166 +95,20 @@ def strip_blinding(cfg):
         if "blinded" in key:
             cfg.pop(key, None)
 
+
 class YamlIncludeSafeLoader(yaml.SafeLoader):
     pass
 
+
 def _construct_include(loader, node):
     return None
+
 
 YamlIncludeSafeLoader.add_constructor("!include", _construct_include)
 
 with open(COMBINED_CONFIG_PATH, "r") as f:
     combined_config = yaml.load(f, Loader=YamlIncludeSafeLoader)
 combined_plotit = combined_config.get("plotIt", {})
-merged["configuration"] = dict(combined_plotit.get("configuration", {}))
-# Ensure plotIt reads ROOT files from the root/ subdirectory.
-merged["configuration"].setdefault("root", "root")
-# Give the x-axis title more room below the frame.
-merged["configuration"]["margin-bottom"] = 0.16
-if "legend" in combined_plotit:
-    merged["legend"] = combined_plotit["legend"]
-if "plotdefaults" in combined_plotit:
-    merged["plotdefaults"] = combined_plotit["plotdefaults"]
-strip_blinding(merged.get("plotdefaults", {}))
-
-# Force a single Run3 era so plotIt sums files across eras.
-merged.setdefault("configuration", {})
-merged["configuration"]["eras"] = [RUN3_ERA]
-strip_blinding(merged["configuration"])
-
-# Sum lumi across eras and store under Run3. Keep the per-era map so we can
-# rescale files back to their original era luminosity after forcing a single
-# combined era.
-era_lumis = {
-    era: float(configs_by_era[era]["configuration"]["luminosity"][era])
-    for era in ERAS
-}
-total_lumi = sum(era_lumis.values())
-merged["configuration"]["luminosity"] = {RUN3_ERA: total_lumi}
-merged["configuration"]["blinded-range-fill-color"] = '#29556270'
-merged["configuration"]["blinded-range-fill-style"] = 1001
-
-# Update file eras and group signals by production mode.
-for filename, info in merged.get("files", {}).items():
-    orig_era = info.get("era")
-    info["era"] = RUN3_ERA
-    if info.get("type") != "data" and orig_era in era_lumis:
-        info["scale"] = info.get("scale", 1.0) * (era_lumis[orig_era] / total_lumi)
-    if info.get("type") == "signal":
-        if filename.startswith(GGF_PREFIX):
-            info["group"] = "HH_ggf"
-        elif filename.startswith(VBF_PREFIX):
-            info["group"] = "HH_vbf"
-
-def merge_signal_files(prefix, out_name, legend, line_color, group_name):
-    signal_files = [
-        fname
-        for fname, info in merged.get("files", {}).items()
-        if info.get("type") == "signal" and fname.startswith(prefix)
-    ]
-    if not signal_files:
-        return
-
-    def add_hist(name, obj, sums_map):
-        if name not in sums_map:
-            sums_map[name] = obj.Clone(name)
-            sums_map[name].SetName(name)
-            sums_map[name].SetDirectory(0)
-        else:
-            sums_map[name].Add(obj)
-
-    sums = {}
-    for fname in signal_files:
-        path = os.path.join(ROOT_DIR, fname)
-        if not os.path.exists(path):
-            raise FileNotFoundError(f"Missing ROOT file: {path}")
-        in_file = ROOT.TFile.Open(path, "READ")
-        if not in_file or in_file.IsZombie():
-            raise RuntimeError(f"Failed to open ROOT file: {path}")
-        for key in in_file.GetListOfKeys():
-            key_name = key.GetName()
-            obj = key.ReadObj()
-            if not obj:
-                continue
-            if obj.InheritsFrom("TH1"):
-                add_hist(key_name, obj, sums)
-            elif obj.InheritsFrom("TDirectory"):
-                for subkey in obj.GetListOfKeys():
-                    sub_name = subkey.GetName()
-                    sub_obj = subkey.ReadObj()
-                    if sub_obj and sub_obj.InheritsFrom("TH1"):
-                        add_hist(sub_name, sub_obj, sums)
-        in_file.Close()
-
-    out_path = os.path.join(ROOT_DIR, out_name)
-    if os.path.exists(out_path):
-        os.remove(out_path)
-    out_file = ROOT.TFile.Open(out_path, "RECREATE")
-    if not out_file or out_file.IsZombie():
-        raise RuntimeError(f"Failed to create ROOT file: {out_path}")
-    out_file.cd()
-    for hist in sums.values():
-        hist.Write()
-    out_file.Write()
-    out_file.Close()
-
-    check_file = ROOT.TFile.Open(out_path, "READ")
-    if not check_file or check_file.IsZombie():
-        raise RuntimeError(f"Failed to re-open ROOT file: {out_path}")
-    written = check_file.GetListOfKeys().GetSize()
-    check_file.Close()
-    if written != len(sums):
-        raise RuntimeError(
-            f"Merged ROOT file {out_path} has {written} histograms, expected {len(sums)}"
-        )
-
-    for fname in signal_files:
-        merged["files"].pop(fname, None)
-
-    merged["files"][out_name] = {
-        "cross-section": 1.0 / total_lumi,
-        "era": RUN3_ERA,
-        "generated-events": 1.0,
-        "group": group_name,
-        "legend": legend,
-        "line-color": line_color,
-        "type": "signal",
-    }
-
-# Merge per-era signal ROOT files into a single Run3 signal per production mode.
-merge_signal_files(
-    GGF_PREFIX,
-    "HH_ggf_Run3.root",
-    "HH_{ggf}^{kappa_lambda=1}->bbWW",
-    3,
-    "HH_ggf",
-)
-merge_signal_files(
-    VBF_PREFIX,
-    "HH_vbf_Run3.root",
-    "HH_{vbf}->bbWW",
-    6,
-    "HH_vbf",
-)
-
-# Define signal groups so legend and colors are consistent after merging.
-merged.setdefault("groups", {})
-merged["groups"].update({
-    "HH_ggf": {
-        "legend": "HH_{ggf}^{kappa_lambda=1}->bbWW",
-        "line-color": 1,
-    },
-    "HH_vbf": {
-        "legend": "HH_{vbf}->bbWW",
-        "line-color": 2,
-    },
-})
-
-# Ensure each plot uses the Run3 era.
-for plot_cfg in merged.get("plots", {}).values():
-    plot_cfg["era"] = RUN3_ERA
-    strip_blinding(plot_cfg)
-
 
 COMBINED_TOTAL_WIDTH = None
 
@@ -357,42 +213,192 @@ def build_combined_hist(root_path):
     return True
 
 
-# Build combined histograms for all samples so they can be drawn on one canvas.
-for root_fname in list(merged.get("files", {}).keys()):
-    build_combined_hist(os.path.join(ROOT_DIR, root_fname))
+def build_merged_output(target_era, era_subset):
+    """Build and write a merged plotIt config for a given era subset."""
+
+    merged = Datacard.merge_plotIt([configs_by_era[e] for e in era_subset])
+    prune_non_sm_signals(merged)
+
+    merged["configuration"] = dict(combined_plotit.get("configuration", {}))
+    merged.setdefault("configuration", {})
+    merged["configuration"].setdefault("root", "root")
+    merged["configuration"]["margin-bottom"] = 0.16
+    merged["configuration"]["eras"] = [target_era]
+    merged["configuration"]["blinded-range-fill-color"] = '#29556270'
+    merged["configuration"]["blinded-range-fill-style"] = 1001
+    strip_blinding(merged["configuration"])
+
+    if "legend" in combined_plotit:
+        merged["legend"] = combined_plotit["legend"]
+    if "plotdefaults" in combined_plotit:
+        merged["plotdefaults"] = combined_plotit["plotdefaults"]
+    strip_blinding(merged.get("plotdefaults", {}))
+
+    era_lumis = {
+        era: float(configs_by_era[era]["configuration"]["luminosity"][era])
+        for era in era_subset
+    }
+    total_lumi = sum(era_lumis.values())
+    merged["configuration"]["luminosity"] = {target_era: total_lumi}
+
+    for filename, info in merged.get("files", {}).items():
+        orig_era = info.get("era")
+        info["era"] = target_era
+        if info.get("type") != "data" and orig_era in era_lumis:
+            info["scale"] = info.get("scale", 1.0) * (era_lumis[orig_era] / total_lumi)
+        if info.get("type") == "signal":
+            if filename.startswith(GGF_PREFIX):
+                info["group"] = "HH_ggf"
+            elif filename.startswith(VBF_PREFIX):
+                info["group"] = "HH_vbf"
+
+    def merge_signal_files(prefix, out_name, legend, line_color, group_name):
+        signal_files = [
+            fname
+            for fname, info in merged.get("files", {}).items()
+            if info.get("type") == "signal" and fname.startswith(prefix)
+        ]
+        if not signal_files:
+            return
+
+        def add_hist(name, obj, sums_map):
+            if name not in sums_map:
+                sums_map[name] = obj.Clone(name)
+                sums_map[name].SetName(name)
+                sums_map[name].SetDirectory(0)
+            else:
+                sums_map[name].Add(obj)
+
+        sums = {}
+        for fname in signal_files:
+            path = os.path.join(ROOT_DIR, fname)
+            if not os.path.exists(path):
+                raise FileNotFoundError(f"Missing ROOT file: {path}")
+            in_file = ROOT.TFile.Open(path, "READ")
+            if not in_file or in_file.IsZombie():
+                raise RuntimeError(f"Failed to open ROOT file: {path}")
+            for key in in_file.GetListOfKeys():
+                key_name = key.GetName()
+                obj = key.ReadObj()
+                if not obj:
+                    continue
+                if obj.InheritsFrom("TH1"):
+                    add_hist(key_name, obj, sums)
+                elif obj.InheritsFrom("TDirectory"):
+                    for subkey in obj.GetListOfKeys():
+                        sub_name = subkey.GetName()
+                        sub_obj = subkey.ReadObj()
+                        if sub_obj and sub_obj.InheritsFrom("TH1"):
+                            add_hist(sub_name, sub_obj, sums)
+            in_file.Close()
+
+        out_path = os.path.join(ROOT_DIR, out_name)
+        if os.path.exists(out_path):
+            os.remove(out_path)
+        out_file = ROOT.TFile.Open(out_path, "RECREATE")
+        if not out_file or out_file.IsZombie():
+            raise RuntimeError(f"Failed to create ROOT file: {out_path}")
+        out_file.cd()
+        for hist in sums.values():
+            hist.Write()
+        out_file.Write()
+        out_file.Close()
+
+        check_file = ROOT.TFile.Open(out_path, "READ")
+        if not check_file or check_file.IsZombie():
+            raise RuntimeError(f"Failed to re-open ROOT file: {out_path}")
+        written = check_file.GetListOfKeys().GetSize()
+        check_file.Close()
+        if written != len(sums):
+            raise RuntimeError(
+                f"Merged ROOT file {out_path} has {written} histograms, expected {len(sums)}"
+            )
+
+        for fname in signal_files:
+            merged["files"].pop(fname, None)
+
+        merged["files"][out_name] = {
+            "cross-section": 1.0 / total_lumi,
+            "era": target_era,
+            "generated-events": 1.0,
+            "group": group_name,
+            "legend": legend,
+            "line-color": line_color,
+            "type": "signal",
+        }
+
+    merge_signal_files(
+        GGF_PREFIX,
+        f"HH_ggf_{target_era}.root",
+        "HH_{ggf}^{kappa_lambda=1}->bbWW",
+        3,
+        "HH_ggf",
+    )
+    merge_signal_files(
+        VBF_PREFIX,
+        f"HH_vbf_{target_era}.root",
+        "HH_{vbf}->bbWW",
+        6,
+        "HH_vbf",
+    )
+
+    merged.setdefault("groups", {})
+    merged["groups"].update({
+        "HH_ggf": {
+            "legend": "HH_{ggf}^{kappa_lambda=1}->bbWW",
+            "line-color": 1,
+        },
+        "HH_vbf": {
+            "legend": "HH_{vbf}->bbWW",
+            "line-color": 2,
+        },
+    })
+
+    DEFAULT_RATIO_RANGE = list(merged.get("plotdefaults", {}).get("ratio-y-axis-range", [0.5, 1.5]))
+    for plot_cfg in merged.get("plots", {}).values():
+        plot_cfg["era"] = target_era
+        plot_cfg["ratio-y-axis-range"] = DEFAULT_RATIO_RANGE
+        strip_blinding(plot_cfg)
+
+    global COMBINED_TOTAL_WIDTH
+    COMBINED_TOTAL_WIDTH = None
+    for root_fname in list(merged.get("files", {}).keys()):
+        build_combined_hist(os.path.join(ROOT_DIR, root_fname))
+
+    plots = merged.setdefault("plots", {})
+    base_plot_names = tuple(cat_name for _, cat_name in COMBINED_CATEGORIES)
+    base_plots = [plots[name] for name in base_plot_names if name in plots]
+    if base_plots:
+        max_lin = max(cfg.get("y-axis-range", [0.0, 0.0])[1] for cfg in base_plots if "y-axis-range" in cfg)
+        max_log = max(cfg.get("log-y-axis-range", [0.0, 0.0])[1] for cfg in base_plots if "log-y-axis-range" in cfg)
+        combined_cfg = dict(base_plots[0])
+        combined_cfg.pop("blinded-range", None)
+        strip_blinding(combined_cfg)
+        combined_cfg["x-axis"] = "DL score (resolved1b | resolved2b | boosted)"
+        x_max = COMBINED_TOTAL_WIDTH if COMBINED_TOTAL_WIDTH is not None else 3.0
+        combined_cfg["x-axis-range"] = [0.0, x_max]
+        combined_cfg["show-overflow"] = False
+        combined_cfg["x-axis-label-size"] = 0
+        combined_cfg["x-axis-hide-ticks"] = True
+        combined_cfg["y-axis-range"] = [0.0, max_lin]
+        combined_cfg["ratio-y-axis-range"] = [0.5, 1.5]
+        combined_cfg["log-y-axis-range"] = [0.01, max_log]
+        plots[COMBINED_HIST] = combined_cfg
+
+    BLIND_RANGE = [0.25, 0.999]
+    for plot_cfg in merged.get("plots", {}).values():
+        plot_cfg["blinded-range"] = BLIND_RANGE
+
+    out_path = f"{PLOTIT_DIR}/plots_{target_era}_combined.yml"
+    with open(out_path, "w") as f:
+        yaml.safe_dump(merged, f)
+
+    print(
+        f"Merged plotIt config written to {out_path} with {len(merged.get('files', {}))} files and {len(merged.get('plots', {}))} plots."
+    )
 
 
-# Add a single plot entry that shows resolved 1b / resolved 2b / boosted on the
-# same x-axis using the concatenated histogram created above.
-plots = merged.setdefault("plots", {})
-base_plot_names = tuple(cat_name for _, cat_name in COMBINED_CATEGORIES)
-base_plots = [plots[name] for name in base_plot_names if name in plots]
-if base_plots:
-    max_lin = max(cfg.get("y-axis-range", [0.0, 0.0])[1] for cfg in base_plots if "y-axis-range" in cfg)
-    max_log = max(cfg.get("log-y-axis-range", [0.0, 0.0])[1] for cfg in base_plots if "log-y-axis-range" in cfg)
-    combined_cfg = dict(base_plots[0])
-    combined_cfg.pop("blinded-range", None)
-    strip_blinding(combined_cfg)
-    combined_cfg["x-axis"] = "DL score (resolved1b | resolved2b | boosted)"
-    x_max = COMBINED_TOTAL_WIDTH if COMBINED_TOTAL_WIDTH is not None else 3.0
-    combined_cfg["x-axis-range"] = [0.0, x_max]
-    combined_cfg["show-overflow"] = False
-    # Hide category bin labels on the ratio pad to avoid the tilted text clutter.
-    combined_cfg["x-axis-label-size"] = 0
-    combined_cfg["x-axis-hide-ticks"] = True
-    combined_cfg["y-axis-range"] = [0.0, max_lin]
-    combined_cfg["log-y-axis-range"] = [0.01, max_log]
-    plots[COMBINED_HIST] = combined_cfg
+if __name__ == "__main__":
+    for target, eras in ERA_GROUPS.items():
+        build_merged_output(target, eras)
 
-# Blind data only in the high-score region.
-BLIND_RANGE = [0.25, 0.999]
-for plot_cfg in merged.get("plots", {}).values():
-    plot_cfg["blinded-range"] = BLIND_RANGE
-    # plotIt applies blinding to data; keep MC visible
-    # plot_cfg["blinded-samples"] = ["data"]
-
-# Write merged yaml.
-with open(f"{PLOTIT_DIR}/plots_Run3.yml", "w") as f:
-    yaml.safe_dump(merged, f)
-
-print(f"Merged plotIt config written to {PLOTIT_DIR}/plots_Run3.yml with {len(merged.get('files', {}))} files and {len(merged.get('plots', {}))} plots.")
