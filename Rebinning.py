@@ -661,12 +661,21 @@ class Threshold3(Rebin):
         edges = [e[-1]]
         idx = b_w.shape[0] - 1
         prev_b_sum = None
-        first_bin_sig = None
+        first_bin_signal = None  # Track signal in the first bin (rightmost)
+        
         while idx >= 0:
-            # If no signal remains in the rest of the histogram, merge everything left
-            if s_w[: idx + 1].sum() <= 0:
-                edges.append(e[0])
+            # If no signal remains (< 1/20 of first bin), merge everything left
+            if first_bin_signal is not None and s_w[: idx + 1].sum() < first_bin_signal / 20.0:
+                # Check if merging all remaining bins would violate monotonicity
+                remaining_b_sum = b_w[: idx + 1].sum()
+                if prev_b_sum is not None and remaining_b_sum < prev_b_sum:
+                    # Merge with previous bin instead of creating a violation
+                    edges.pop()
+                    edges.append(e[0])
+                else:
+                    edges.append(e[0])
                 break
+            
             left = idx
             while True:
                 b_sum = b_w[left:idx + 1].sum()
@@ -692,9 +701,22 @@ class Threshold3(Rebin):
                             continue
 
                 # Enforce monotonic increase of background yields from right to left
-                if prev_b_sum is not None and b_sum < prev_b_sum and left > 0:
-                    left -= 1
-                    continue
+                if prev_b_sum is not None and b_sum < prev_b_sum:
+                    if left > 0:
+                        # Try to expand left to fix monotonicity
+                        left -= 1
+                        continue
+                    else:
+                        # At leftmost edge - must merge with previous bin to the right
+                        edges.pop()
+                        # Recalculate from the previous bin's left edge
+                        prev_left = int(edges[-1] // (e[1] - e[0])) if len(edges) > 1 else 0
+                        left = prev_left
+                        b_sum = b_w[left:idx + 1].sum()
+                        b_var = b_s2[left:idx + 1].sum()
+                        s_sum = s_w[left:idx + 1].sum()
+                        prev_b_sum = None  # Reset since we merged
+                        break
 
                 break
 
@@ -702,26 +724,34 @@ class Threshold3(Rebin):
             b_sum = b_w[left:idx + 1].sum()
             b_var = b_s2[left:idx + 1].sum()
             s_sum = s_w[left:idx + 1].sum()
-            # If requirements or monotonic condition are still violated, keep merging left if possible
+            
+            # If requirements are still violated, keep merging left if possible
             while left > 0 and (
                 b_sum < min_mc
                 or (np.sqrt(b_var) / b_sum if b_sum > 0 else np.inf) > max_rel_unc
-                or (prev_b_sum is not None and b_sum < prev_b_sum)
             ):
                 left -= 1
                 b_sum = b_w[left:idx + 1].sum()
                 b_var = b_s2[left:idx + 1].sum()
                 s_sum = s_w[left:idx + 1].sum()
-
-            # If the signal in this bin drops below 1/100th of the first bin signal, merge all remaining
-            if first_bin_sig is not None and s_sum < first_bin_sig / 100.0:
-                edges.append(e[0])
-                break
+            
+            # Final check: if at left==0 and still have monotonic violation, merge with previous bin
+            if left == 0 and prev_b_sum is not None and b_sum < prev_b_sum:
+                edges.pop()
+                prev_left = int(edges[-1] // (e[1] - e[0])) if len(edges) > 1 else 0
+                left = prev_left
+                b_sum = b_w[left:idx + 1].sum()
+                b_var = b_s2[left:idx + 1].sum()
+                s_sum = s_w[left:idx + 1].sum()
+                prev_b_sum = None
 
             edges.append(e[left])
+            
+            # Track first bin signal for depletion check
+            if first_bin_signal is None:
+                first_bin_signal = s_sum
+                
             prev_b_sum = b_sum
-            if first_bin_sig is None:
-                first_bin_sig = s_sum
             idx = left - 1
 
         self.ne, counts = np.unique(edges[::-1], return_counts=True)
