@@ -640,6 +640,59 @@ class Threshold2(Rebin):
         return idx[:idx_num]
 
 
+def _load_root_histogram(root_path, hist_name):
+    tf = ROOT.TFile.Open(root_path, 'READ')
+    if tf is None or tf.IsZombie():
+        logging.warning(f'Could not open ROOT file {root_path}')
+        return None
+    hist = tf.Get(hist_name)
+    if hist is None:
+        logging.warning(f'Histogram {hist_name} not found in {root_path}')
+        tf.Close()
+        return None
+    out = deepcopy(hist)
+    tf.Close()
+    return out
+
+
+def compute_threshold3_edges_from_datacard_roots(root_files, backgrounds, signals, min_mc, max_rel_unc):
+    if not isinstance(root_files, list) or len(root_files) == 0:
+        raise RuntimeError('`root_files` must be a non-empty list')
+    if not isinstance(backgrounds, list) or len(backgrounds) == 0:
+        raise RuntimeError('`backgrounds` must be a non-empty list')
+    if not isinstance(signals, list) or len(signals) == 0:
+        raise RuntimeError('`signals` must be a non-empty list')
+
+    bkg_hists = []
+    sig_hists = []
+
+    for root_path in root_files:
+        for group in backgrounds:
+            hist = _load_root_histogram(root_path, group)
+            if hist is not None:
+                bkg_hists.append(hist)
+        for group in signals:
+            hist = _load_root_histogram(root_path, group)
+            if hist is not None:
+                sig_hists.append(hist)
+
+    if len(bkg_hists) == 0:
+        raise RuntimeError('No background histograms were found in the provided ROOT files')
+    if len(sig_hists) == 0:
+        raise RuntimeError('No signal histograms were found in the provided ROOT files')
+
+    combined_bkg = deepcopy(bkg_hists[0])
+    for hist in bkg_hists[1:]:
+        combined_bkg.Add(hist)
+
+    combined_sig = deepcopy(sig_hists[0])
+    for hist in sig_hists[1:]:
+        combined_sig.Add(hist)
+
+    t3_obj = Threshold3([combined_bkg], [combined_sig], min_mc=min_mc, max_rel_unc=max_rel_unc)
+    return t3_obj.ne
+
+
 class Threshold3(Rebin):
     """
         Right-to-left aggregation with yield/unc constraints and an optional S^2/B improvement check.
@@ -696,7 +749,7 @@ class Threshold3(Rebin):
                     if rel_unc_merge <= max_rel_unc and b_sum_merge >= min_mc:
                         ratio_now = (s_sum ** 2) / b_sum if b_sum > 0 else 0.0
                         ratio_merge = (s_sum_merge ** 2) / b_sum_merge if b_sum_merge > 0 else 0.0
-                        if ratio_merge > ratio_now:
+                        if ratio_now <= 0.0 or ratio_merge >= 0.99 * ratio_now:
                             left -= 1
                             continue
 

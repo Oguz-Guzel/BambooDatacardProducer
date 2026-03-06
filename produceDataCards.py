@@ -69,6 +69,7 @@ COMBINE_DEFAULT_ARGS = [
 
 
 class Datacard:
+    _combined_threshold3_edges = {}
     def __init__(self,outputDir=None,configPath=None,path=None,yamlName=None,worker=None,groups=None,shapeSyst=None,normSyst=None,histConverter=None,era=None,use_syst=False,fix_histograms=True,include_overflow=False,root_subdir=None,histAdditionals=None,histCorrections=None,pseudodata=False,rebin=None,histEdit=None,histCut=None,textfiles=None,plotIt=None,combineConfigs=None,logName=None,custom_args=None,save_datacard=True,**kwargs):
         self.outputDir          = outputDir
         self.configPath         = configPath
@@ -195,6 +196,101 @@ class Datacard:
             return None
         else: 
             raise RuntimeError(f"{name} format {type(entries)} not understood")
+
+
+    @staticmethod
+    def _build_config_for_era(config, era, eras_all):
+        config_era = {}
+        for itemName,itemCfg in config.items():
+            if isinstance(itemCfg,dict):
+                keys = [str(key) for key in itemCfg.keys()]
+                if len(keys) == 0:
+                    config_era[itemName] = dict()
+                elif len(set(keys).intersection(set(eras_all))) > 0:
+                    config_era[itemName] = itemCfg[list(itemCfg)[keys.index(era)]]
+                else:
+                    config_era[itemName] = itemCfg
+            else:
+                config_era[itemName] = itemCfg
+        config_era['era'] = era
+        return config_era
+
+
+    @classmethod
+    def compute_combined_threshold3_edges(cls, config_path, custom_args, combine_eras, cat_name, backgrounds, signals, min_mc, max_rel_unc):
+        from Rebinning import Threshold3
+        key = (
+            tuple(combine_eras),
+            cat_name,
+            tuple(backgrounds),
+            tuple(signals),
+            float(min_mc),
+            float(max_rel_unc),
+        )
+        if key in cls._combined_threshold3_edges:
+            return cls._combined_threshold3_edges[key]
+
+        if config_path is None or not os.path.isfile(config_path):
+            raise RuntimeError('`configPath` is required to compute combined-era binning')
+
+        config = parseYaml(config_path, custom_args)
+        eras_all = config['era'] if isinstance(config['era'],list) else [config['era']]
+        eras_all = [str(e) for e in eras_all]
+
+        combined_bkg_hists = []
+        combined_sig_hists = []
+
+        for era in combine_eras:
+            if str(era) not in eras_all:
+                raise RuntimeError(f'Era {era} not found in config')
+            config_era = cls._build_config_for_era(config, str(era), eras_all)
+
+            temp = Datacard(
+                configPath=config_path,
+                outputDir=config_era.get('outputDir'),
+                path=config_era.get('path'),
+                yamlName=config_era.get('yamlName'),
+                worker=False,
+                groups=config_era.get('groups'),
+                shapeSyst=config_era.get('shapeSyst'),
+                normSyst=config_era.get('normSyst'),
+                histConverter={cat_name: config_era['histConverter'][cat_name]},
+                era=str(era),
+                use_syst=False,
+                fix_histograms=False,
+                include_overflow=config_era.get('include_overflow', False),
+                root_subdir=config_era.get('root_subdir'),
+                histAdditionals=None,
+                histCorrections=None,
+                pseudodata=False,
+                rebin=None,
+                histEdit=None,
+                histCut=None,
+                textfiles=None,
+                plotIt=None,
+                combineConfigs=None,
+                logName='combined_binning.log',
+                custom_args=custom_args,
+                save_datacard=False,
+            )
+
+            temp.initialize()
+            temp.yaml_dict = temp.loadYaml(temp.path,temp.yamlName)
+            temp.loopOverFiles()
+            temp.applyOverflow()
+
+            histName = f'{cat_name}_{era}'
+            combined_bkg_hists.extend(temp.rebinGetHists(histName,backgrounds))
+            combined_sig_hists.extend(temp.rebinGetHists(histName,signals))
+
+        if len(combined_bkg_hists) == 0:
+            raise RuntimeError('No background histograms found for combined binning')
+        if len(combined_sig_hists) == 0:
+            raise RuntimeError('No signal histograms found for combined binning')
+
+        tObj = Threshold3(combined_bkg_hists, combined_sig_hists, min_mc=min_mc, max_rel_unc=max_rel_unc)
+        cls._combined_threshold3_edges[key] = tObj.ne
+        return tObj.ne
 
 
     def run_production(self):
@@ -1835,11 +1931,13 @@ class Datacard:
         """
             Using the threshold3 rebinning (1D)
             histName: name of histogram in keys of self.content
-            params : (list) [backgrounds (list), signals (list | str), min_mc (float), max_rel_unc (float)]
+            params : (list) [backgrounds (list), signals (list | str), min_mc (float), max_rel_unc (float), optional (dict)]
+                optional dict keys:
+                    - combine_eras: list of eras to combine for binning
         """
-        from Rebinning import Threshold3
+        from Rebinning import Threshold3, Boundary
         assert isinstance(params,list)
-        assert len(params) == 4
+        assert len(params) in [4,5]
         assert isinstance(params[0],list)
         assert isinstance(params[1],(list,str))
         assert isinstance(params[2],(float,int))
@@ -1848,6 +1946,32 @@ class Datacard:
         signals            = params[1] if isinstance(params[1],list) else [params[1]]
         min_mc             = float(params[2])
         max_rel_unc        = float(params[3])
+
+        extra_cfg = params[4] if len(params) == 5 and isinstance(params[4],dict) else None
+        if extra_cfg is not None:
+            combine_eras = extra_cfg.get('combine_eras')
+            if combine_eras is not None:
+                cat_name = histName.replace(f'_{self.era}','')
+                edges = Datacard.compute_combined_threshold3_edges(
+                    config_path=self.configPath,
+                    custom_args=self.custom_args,
+                    combine_eras=[str(e) for e in combine_eras],
+                    cat_name=cat_name,
+                    backgrounds=backgrounds,
+                    signals=signals,
+                    min_mc=min_mc,
+                    max_rel_unc=max_rel_unc,
+                )
+                boundObj = Boundary(boundaries=edges)
+                if logging.root.level <= 10:
+                    pbar = enlighten.Counter(total=self.countPerHistName(histName), desc='Progress', unit='histograms')
+                for group in self.content[histName].keys():
+                    for systName,hist in self.content[histName][group].items():
+                        self.content[histName][group][systName] = boundObj(hist)
+                        if logging.root.level <= 10:
+                            pbar.update()
+                return
+
         hists_bkg          = self.rebinGetHists(histName,backgrounds)
         hists_sig          = self.rebinGetHists(histName,signals)
         tObj = Threshold3(hists_bkg,hists_sig,min_mc=min_mc,max_rel_unc=max_rel_unc)
