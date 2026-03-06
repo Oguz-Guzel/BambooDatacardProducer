@@ -11,7 +11,6 @@ try:
 except Exception as exc:
     raise RuntimeError("ROOT is required to merge signal ROOT files") from exc
 
-ERAS = ["2022", "2022EE", "2023", "2023BPix"]
 RUN3_ERA = "Run3"
 def _parse_args():
     parser = argparse.ArgumentParser(
@@ -25,10 +24,17 @@ def _parse_args():
         "PLOT_PREFIX",
         help="Prefix for plot/histogram names (e.g. SR, DY, TT).",
     )
+    parser.add_argument(
+        "eras",
+        nargs="?",
+        default=RUN3_ERA,
+        help="Eras to merge (comma-separated, e.g. 2022,2023 or Run3 for all eras).",
+    )
     return parser.parse_args()
 
 
 _args = _parse_args()
+ERAS = _args.eras.split(",") if _args.eras != RUN3_ERA else ["2022", "2022EE", "2023", "2023BPix"]
 PLOTIT_DIR = os.path.abspath(_args.PLOTIT_DIR)
 PLOT_PREFIX = _args.PLOT_PREFIX.rstrip("_")
 PLOT_NAME_PREFIX = f"{PLOT_PREFIX}_"
@@ -58,8 +64,9 @@ for era in ERAS:
 # Era subsets to merge separately.
 ERA_GROUPS = {
     "Run3": ERAS,
-    "2022": ["2022", "2022EE"],
-    "2023": ["2023", "2023BPix"],
+    ERAS[0]: [ERAS[0], ERAS[1]],
+    # "2022": ["2022", "2022EE"],
+    # "2023": ["2023", "2023BPix"],
 }
 def prune_non_sm_signals(cfg):
     """Drop non-SM HH signals from files and plot sample lists."""
