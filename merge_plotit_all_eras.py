@@ -96,11 +96,9 @@ COMBINED_CONFIG_PATH = "/afs/cern.ch/work/a/aguzel/private/wwbb-run3-datacards/c
 
 
 def strip_blinding(cfg):
-    """Remove any keys related to blinding from a plotIt configuration mapping."""
+    """Remove per-plot blinding range while keeping global blinding style settings."""
 
-    for key in list(cfg.keys()):
-        if "blinded" in key:
-            cfg.pop(key, None)
+    cfg.pop("blinded-range", None)
 
 
 class YamlIncludeSafeLoader(yaml.SafeLoader):
