@@ -1556,6 +1556,8 @@ class Datacard:
                         rebinFunc = self.rebinThreshold
                     elif method == 'threshold2':
                         rebinFunc = self.rebinThreshold2
+                    elif method == 'threshold3':
+                        rebinFunc = self.rebinThreshold3
                     # 2D rebinnings #
                     elif method == 'classic2d':
                         rebinFunc = self.rebinClassic2D
@@ -1826,6 +1828,34 @@ class Datacard:
         for group in self.content[histName].keys():
             for systName,hist in self.content[histName][group].items():
                 self.content[histName][group][systName] = tObj(hist) 
+                if logging.root.level <= 10:
+                    pbar.update()
+
+    def rebinThreshold3(self,histName,params):
+        """
+            Using the threshold3 rebinning (1D)
+            histName: name of histogram in keys of self.content
+            params : (list) [backgrounds (list), signals (list | str), min_mc (float), max_rel_unc (float)]
+        """
+        from Rebinning import Threshold3
+        assert isinstance(params,list)
+        assert len(params) == 4
+        assert isinstance(params[0],list)
+        assert isinstance(params[1],(list,str))
+        assert isinstance(params[2],(float,int))
+        assert isinstance(params[3],(float,int))
+        backgrounds        = params[0]
+        signals            = params[1] if isinstance(params[1],list) else [params[1]]
+        min_mc             = float(params[2])
+        max_rel_unc        = float(params[3])
+        hists_bkg          = self.rebinGetHists(histName,backgrounds)
+        hists_sig          = self.rebinGetHists(histName,signals)
+        tObj = Threshold3(hists_bkg,hists_sig,min_mc=min_mc,max_rel_unc=max_rel_unc)
+        if logging.root.level <= 10:
+            pbar = enlighten.Counter(total=self.countPerHistName(histName), desc='Progress', unit='histograms')
+        for group in self.content[histName].keys():
+            for systName,hist in self.content[histName][group].items():
+                self.content[histName][group][systName] = tObj(hist)
                 if logging.root.level <= 10:
                     pbar.update()
 

@@ -87,6 +87,18 @@ from numpy_hist import NumpyHist
                 - fallbacks must have same length as list of histograms
             Then any histogram h can be called with the class to rebin them with such edges
 
+    - Threshold3 : Iterative method that starts from the right of the histogram and aggregates bins
+                until both conditions are met:
+                    - a minimum total MC background yield per bin (user provided)
+                    - a maximum relative statistical uncertainty per bin (user provided)
+        example:
+            ```
+                obj = Threshold3([h_bkg1, h_bkg2], min_mc=10., max_rel_unc=0.40)
+                new_h = obj(h_any)
+            ```
+            The bin edges are computed such that every rebinned bin respects the requested minimum
+            background yield and does not exceed the allowed relative uncertainty.
+
     The same algorithm also work in 2D versions (Boundary2D, Quantile2D, Threshold2D)
     in exactly the same way except the parameters have to be provided for both the x and y axes
     These algorithms work independently on the x and y axis by projections
@@ -626,6 +638,100 @@ class Threshold2(Rebin):
                 else:
                     break
         return idx[:idx_num]
+
+
+class Threshold3(Rebin):
+    """
+        Right-to-left aggregation with yield/unc constraints and an optional S^2/B improvement check.
+    """
+
+    def __init__(self, h_bkg, h_sig, min_mc=5.0, max_rel_unc=0.40):
+        if min_mc <= 0:
+            raise RuntimeError('`min_mc` must be positive')
+        if max_rel_unc <= 0:
+            raise RuntimeError('`max_rel_unc` must be positive')
+
+        bkg = self._processHist(h_bkg)
+        sig = self._processHist(h_sig)
+        b_w = bkg.w
+        b_s2 = bkg.s2
+        s_w = sig.w
+        e = bkg.e
+
+        edges = [e[-1]]
+        idx = b_w.shape[0] - 1
+        prev_b_sum = None
+        first_bin_sig = None
+        while idx >= 0:
+            # If no signal remains in the rest of the histogram, merge everything left
+            if s_w[: idx + 1].sum() <= 0:
+                edges.append(e[0])
+                break
+            left = idx
+            while True:
+                b_sum = b_w[left:idx + 1].sum()
+                b_var = b_s2[left:idx + 1].sum()
+                s_sum = s_w[left:idx + 1].sum()
+                rel_unc = np.inf if b_sum <= 0 else np.sqrt(b_var) / b_sum
+
+                # Enforce both requirements: sufficient yield AND below max relative uncertainty
+                if (b_sum < min_mc or rel_unc > max_rel_unc) and left > 0:
+                    left -= 1
+                    continue
+
+                if b_sum >= min_mc and rel_unc <= max_rel_unc and left > 0:
+                    b_sum_merge = b_sum + b_w[left - 1]
+                    b_var_merge = b_var + b_s2[left - 1]
+                    s_sum_merge = s_sum + s_w[left - 1]
+                    rel_unc_merge = np.inf if b_sum_merge <= 0 else np.sqrt(b_var_merge) / b_sum_merge
+                    if rel_unc_merge <= max_rel_unc and b_sum_merge >= min_mc:
+                        ratio_now = (s_sum ** 2) / b_sum if b_sum > 0 else 0.0
+                        ratio_merge = (s_sum_merge ** 2) / b_sum_merge if b_sum_merge > 0 else 0.0
+                        if ratio_merge > ratio_now:
+                            left -= 1
+                            continue
+
+                # Enforce monotonic increase of background yields from right to left
+                if prev_b_sum is not None and b_sum < prev_b_sum and left > 0:
+                    left -= 1
+                    continue
+
+                break
+
+            # Recompute final sums for the chosen left boundary
+            b_sum = b_w[left:idx + 1].sum()
+            b_var = b_s2[left:idx + 1].sum()
+            s_sum = s_w[left:idx + 1].sum()
+            # If requirements or monotonic condition are still violated, keep merging left if possible
+            while left > 0 and (
+                b_sum < min_mc
+                or (np.sqrt(b_var) / b_sum if b_sum > 0 else np.inf) > max_rel_unc
+                or (prev_b_sum is not None and b_sum < prev_b_sum)
+            ):
+                left -= 1
+                b_sum = b_w[left:idx + 1].sum()
+                b_var = b_s2[left:idx + 1].sum()
+                s_sum = s_w[left:idx + 1].sum()
+
+            # If the signal in this bin drops below 1/100th of the first bin signal, merge all remaining
+            if first_bin_sig is not None and s_sum < first_bin_sig / 100.0:
+                edges.append(e[0])
+                break
+
+            edges.append(e[left])
+            prev_b_sum = b_sum
+            if first_bin_sig is None:
+                first_bin_sig = s_sum
+            idx = left - 1
+
+        self.ne, counts = np.unique(edges[::-1], return_counts=True)
+        if (counts > 1).any():
+            logging.warning(f'There were repetitions in the new binning : {self.ne}')
+
+        rebinned_b = bkg.rebin(self.ne)
+        rel_unc_bins = np.where(rebinned_b.w > 0, np.sqrt(rebinned_b.s2) / rebinned_b.w, np.inf)
+        if (rebinned_b.w < min_mc).any() or (rel_unc_bins > max_rel_unc).any():
+            logging.warning(f'Unable to enforce min_mc={min_mc} or max_rel_unc={max_rel_unc} for all bins with binning {self.ne}')
 
 
 class Boundary(Rebin):
