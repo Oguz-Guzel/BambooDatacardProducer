@@ -3,7 +3,6 @@ import os
 from array import array
 
 import yaml
-from produceDataCards import Datacard
 
 try:
     import ROOT
@@ -11,63 +10,70 @@ try:
 except Exception as exc:
     raise RuntimeError("ROOT is required to merge signal ROOT files") from exc
 
-RUN3_ERA = "Run3"
+
 def _parse_args():
     parser = argparse.ArgumentParser(
-        description="Merge plotIt YAMLs and ROOT files across eras into a Run3 configuration."
-    )
-    parser.add_argument(
-        "PLOTIT_DIR",
-        help="Path to the plotIt directory containing plots_<ERA>.yml and root/",
+        description=(
+            "Build per-era combined histograms (concatenated categories) from existing "
+            "plotIt configs, normalizing by bin width."
+        )
     )
     parser.add_argument(
         "PLOT_PREFIX",
         help="Prefix for plot/histogram names (e.g. SR, DY, TT).",
     )
     parser.add_argument(
-        "eras",
-        nargs="?",
-        default=RUN3_ERA,
-        help="Eras to merge (comma-separated, e.g. 2022,2023 or Run3 for all eras).",
+        "--config-2022",
+        dest="config_2022",
+        default="/afs/cern.ch/work/a/aguzel/private/wwbb-run3-datacards/output/"
+                "SR_v1.4.8_heuristic_v4-5_DYfix/plotit/plots_2022_combined.yml",
+        help="Absolute path to the 2022 plotIt YAML (combined).",
+    )
+    parser.add_argument(
+        "--config-2023",
+        dest="config_2023",
+        default="/afs/cern.ch/work/a/aguzel/private/wwbb-run3-datacards/output/"
+                "SR_v1.4.8_heuristic_v4-5_DYfix/plotit/plots_2023_combined.yml",
+        help="Absolute path to the 2023 plotIt YAML (combined).",
+    )
+    parser.add_argument(
+        "--output-suffix",
+        default="_with_combined",
+        help="Suffix to append to output YAML file names before the extension.",
+    )
+    parser.add_argument(
+        "--blind",
+        action="store_true",
+        help="Enable blinding (set blinded-range in output plots)",
     )
     return parser.parse_args()
 
 
 _args = _parse_args()
-ERAS = _args.eras.split(",") if _args.eras != RUN3_ERA else ["2022", "2022EE", "2023", "2023BPix"]
-PLOTIT_DIR = os.path.abspath(_args.PLOTIT_DIR)
 PLOT_PREFIX = _args.PLOT_PREFIX.rstrip("_")
 PLOT_NAME_PREFIX = f"{PLOT_PREFIX}_"
-ROOT_DIR = os.path.join(PLOTIT_DIR, "root")
+ENABLE_BLINDING = _args.blind
 
 GGF_PREFIX = "ggHH_kl_1_kt_1_hbbhww_"
 VBF_PREFIX = "qqHH_CV_1_C2V_1_kl_1_hbbhww_"
-ALLOWED_SIGNAL_PREFIXES = (GGF_PREFIX, VBF_PREFIX)
+ALT_GGF_PREFIX = "HH_ggf_"
+ALT_VBF_PREFIX = "HH_vbf_"
+ALLOWED_SIGNAL_PREFIXES = (GGF_PREFIX, VBF_PREFIX, ALT_GGF_PREFIX, ALT_VBF_PREFIX)
 COMBINED_HIST = f"{PLOT_NAME_PREFIX}combined"
+# Plot styling constants
+Y_MAX = 1_000_000_000.0
+HLINE_Y = 1_000_000.0
+# Default guesses; actual category names are detected dynamically from the YAML.
 COMBINED_CATEGORIES = [
     ("Resolved 1b", f"{PLOT_NAME_PREFIX}resolved1b"),
     ("Resolved 2b", f"{PLOT_NAME_PREFIX}resolved2b"),
     ("Boosted", f"{PLOT_NAME_PREFIX}boosted"),
+    ("VBF resolved", f"{PLOT_NAME_PREFIX}vbf_resolved"),
+    ("VBF boosted", f"{PLOT_NAME_PREFIX}vbf_boosted"),
 ]
 COMBINED_BIN_UNIT = 1.0
 COMBINED_X_TITLE_OFFSET = 12.4
 
-# Load per-era plotIt configs.
-configs = []
-configs_by_era = {}
-for era in ERAS:
-    with open(f"{PLOTIT_DIR}/plots_{era}.yml", "r") as f:
-        cfg = yaml.safe_load(f)
-        configs.append(cfg)
-        configs_by_era[era] = cfg
-
-# Era subsets to merge separately.
-ERA_GROUPS = {
-    "Run3": ERAS,
-    ERAS[0]: [ERAS[0], ERAS[1]],
-    # "2022": ["2022", "2022EE"],
-    # "2023": ["2023", "2023BPix"],
-}
 def prune_non_sm_signals(cfg):
     """Drop non-SM HH signals from files and plot sample lists."""
 
@@ -88,11 +94,7 @@ def prune_non_sm_signals(cfg):
             if samples:
                 plot["samples"] = [s for s in samples if s not in drop_set]
 
-
 prune_non_sm_signals_dataclass = prune_non_sm_signals  # keep name for reuse in functions
-
-# Use plotIt configuration from the combined config file.
-COMBINED_CONFIG_PATH = "/afs/cern.ch/work/a/aguzel/private/wwbb-run3-datacards/config/config_combined_sr.yml"
 
 
 def strip_blinding(cfg):
@@ -101,24 +103,69 @@ def strip_blinding(cfg):
     cfg.pop("blinded-range", None)
 
 
-class YamlIncludeSafeLoader(yaml.SafeLoader):
-    pass
+def remap_groups(cfg):
+    """Regroup backgrounds: Higgs (ZH, tHq, ttH, tHW), keep TTbar/DY/single-top, others -> other_bkg."""
 
+    files = cfg.get("files", {})
+    for info in files.values():
+        g = info.get("group")
+        if info.get("type") == "signal":
+            continue
+        if g in HIGGS_GROUPS:
+            info["group"] = "SingleHiggs"
+        elif g in SINGLE_TOP_GROUPS:
+            info["group"] = "SingleTop"
+        elif g in KEEP_GROUPS:
+            info["group"] = g
+        else:
+            info["group"] = "other_bkg"
 
-def _construct_include(loader, node):
-    return None
+    groups = cfg.setdefault("groups", {})
+    groups.setdefault("SingleHiggs", {"legend": "Single Higgs", "fill-color": "#6c9bd2"})
+    groups.setdefault("SingleTop", {"legend": "Single top", "fill-color": "#f2b86c"})
+    groups.setdefault("other_bkg", {"legend": "Other bkg", "fill-color": "#a0a0a0"})
+    # Preserve existing keep groups; ensure they exist if missing.
+    for g in KEEP_GROUPS:
+        groups.setdefault(g, {"legend": g})
 
-
-YamlIncludeSafeLoader.add_constructor("!include", _construct_include)
-
-with open(COMBINED_CONFIG_PATH, "r") as f:
-    combined_config = yaml.load(f, Loader=YamlIncludeSafeLoader)
-combined_plotit = combined_config.get("plotIt", {})
 
 COMBINED_TOTAL_WIDTH = None
+COMBINED_BOUNDARIES = None
+LINE_STYLE = {
+    "line-width": 2,
+    "line-color": "#000000",
+    "line-type": 1,
+}
+KEEP_GROUPS = {"DY", "TTbar", "data_obs", "HH_ggf", "HH_vbf"}
+SINGLE_TOP_GROUPS = {"ST_tW", "ST_tchan"}
+HIGGS_GROUPS = {"ZH", "tHq", "ttH", "tHW"}
 
 
-def build_combined_hist(root_path):
+def detect_categories(plot_names):
+    """Infer the category plot names from the YAML keys.
+
+    Preference order: resolved1b, resolved2b, boosted. Falls back to the
+    default COMBINED_CATEGORIES if detection fails.
+    """
+
+    keywords = [
+        ("resolved1b", "Resolved 1b"),
+        ("resolved2b", "Resolved 2b"),
+        ("boosted", "Boosted"),
+        ("vbf_resolved", "VBF resolved"),
+        ("vbf_boosted", "VBF boosted"),
+    ]
+    lowered = {name.lower(): name for name in plot_names}
+    categories = []
+    for key, label in keywords:
+        match = next((orig for low, orig in lowered.items() if key in low), None)
+        if match:
+            categories.append((label, match))
+
+    return categories if categories else list(COMBINED_CATEGORIES)
+
+
+def build_combined_hist(root_path, categories, combined_hist_name, normalize_bin_width=True):
     """Concatenate resolved1b/2b/boosted histograms (nominal and syst) into one histogram.
 
     For every variation suffix ("" for nominal, "__systUp", ...), this builds
@@ -133,10 +180,10 @@ def build_combined_hist(root_path):
     # Drop any previously written combined (nominal or syst) histograms.
     for key in list(f_in.GetListOfKeys()):
         name = key.GetName()
-        if name.startswith(COMBINED_HIST):
+        if name.startswith(combined_hist_name):
             f_in.Delete(f"{name};*")
 
-    cat_names = [name for _, name in COMBINED_CATEGORIES]
+    cat_names = [name for _, name in categories]
     nominals = {}
     for cat_name in cat_names:
         h = f_in.Get(cat_name)
@@ -150,10 +197,13 @@ def build_combined_hist(root_path):
     gap = 0.0  # zero gap to avoid an empty bin at the right edge
     offset = 0.0
     cat_bins = {}
-    for cat_name in cat_names:
+    boundaries = []
+    for idx, cat_name in enumerate(cat_names):
         hist = nominals[cat_name]
         nbins = hist.GetXaxis().GetNbins()
         cat_bins[cat_name] = nbins
+        if idx > 0:
+            boundaries.append(offset)
         for ibin in range(1, nbins + 1):
             edges.append(offset + ibin * COMBINED_BIN_UNIT)
         offset = edges[-1] + gap
@@ -181,7 +231,7 @@ def build_combined_hist(root_path):
     for suffix, cat_map in variations.items():
         if any(cat_name not in cat_map for cat_name in cat_names):
             continue
-        hname = f"{COMBINED_HIST}{suffix}"
+        hname = f"{combined_hist_name}{suffix}"
         combined = ROOT.TH1D(hname, nominals[cat_names[0]].GetTitle(), len(edges) - 1, arr)
         if not combined:
             f_in.Close()
@@ -189,16 +239,19 @@ def build_combined_hist(root_path):
         combined.Sumw2()
 
         start_bin = 1
-        for (label, _), cat_name in zip(COMBINED_CATEGORIES, cat_names):
+        for (label, _), cat_name in zip(categories, cat_names):
             hist = cat_map[cat_name]
             nbins = cat_bins[cat_name]
             if hist.GetXaxis().GetNbins() != nbins:
                 f_in.Close()
                 raise RuntimeError(f"Bin mismatch for {cat_name}{suffix} in {root_path}")
             for ibin in range(1, nbins + 1):
+                width = hist.GetXaxis().GetBinWidth(ibin) if normalize_bin_width else 1.0
                 target_bin = start_bin + ibin - 1
-                combined.SetBinContent(target_bin, hist.GetBinContent(ibin))
-                combined.SetBinError(target_bin, hist.GetBinError(ibin))
+                content = hist.GetBinContent(ibin)
+                error = hist.GetBinError(ibin)
+                combined.SetBinContent(target_bin, content / width)
+                combined.SetBinError(target_bin, error / width)
             if suffix == "":
                 mid_bin = start_bin + nbins // 2
                 combined.GetXaxis().SetBinLabel(mid_bin, label)
@@ -212,198 +265,126 @@ def build_combined_hist(root_path):
 
     f_in.Close()
 
-    global COMBINED_TOTAL_WIDTH
+    global COMBINED_TOTAL_WIDTH, COMBINED_BOUNDARIES
     if COMBINED_TOTAL_WIDTH is None:
         COMBINED_TOTAL_WIDTH = edges[-1] - edges[0]
+    if COMBINED_BOUNDARIES is None:
+        COMBINED_BOUNDARIES = boundaries
     return True
 
 
-def build_merged_output(target_era, era_subset):
-    """Build and write a merged plotIt config for a given era subset."""
+def process_single_config(config_path):
+    """Build a combined plot for a single era config, writing a new YAML alongside it."""
 
-    merged = Datacard.merge_plotIt([configs_by_era[e] for e in era_subset])
-    prune_non_sm_signals(merged)
+    with open(config_path, "r") as f:
+        cfg = yaml.safe_load(f)
 
-    merged["configuration"] = dict(combined_plotit.get("configuration", {}))
-    merged.setdefault("configuration", {})
-    merged["configuration"].setdefault("root", "root")
-    merged["configuration"]["margin-bottom"] = 0.16
-    merged["configuration"]["eras"] = [target_era]
-    merged["configuration"]["blinded-range-fill-color"] = '#29556270'
-    merged["configuration"]["blinded-range-fill-style"] = 1001
-    strip_blinding(merged["configuration"])
+    prune_non_sm_signals(cfg)
+    remap_groups(cfg)
 
-    if "legend" in combined_plotit:
-        merged["legend"] = combined_plotit["legend"]
-    if "plotdefaults" in combined_plotit:
-        merged["plotdefaults"] = combined_plotit["plotdefaults"]
-    strip_blinding(merged.get("plotdefaults", {}))
+    plotdefaults = cfg.get("plotdefaults", {})
+    strip_blinding(plotdefaults)
+    strip_blinding(cfg.get("configuration", {}))
 
-    era_lumis = {
-        era: float(configs_by_era[era]["configuration"]["luminosity"][era])
-        for era in era_subset
-    }
-    total_lumi = sum(era_lumis.values())
-    merged["configuration"]["luminosity"] = {target_era: total_lumi}
+    # Force a consistent global y-max used by plotIt when defaults propagate.
+    if "y-axis-range" in plotdefaults:
+        ymin, _ = plotdefaults.get("y-axis-range", [1.0e-5, Y_MAX])
+        plotdefaults["y-axis-range"] = [ymin, Y_MAX]
 
-    for filename, info in merged.get("files", {}).items():
-        orig_era = info.get("era")
-        info["era"] = target_era
-        if info.get("type") != "data" and orig_era in era_lumis:
-            info["scale"] = info.get("scale", 1.0) * (era_lumis[orig_era] / total_lumi)
-        if info.get("type") == "signal":
-            if filename.startswith(GGF_PREFIX):
-                info["group"] = "HH_ggf"
-            elif filename.startswith(VBF_PREFIX):
-                info["group"] = "HH_vbf"
+    # Derive ROOT directory from the config.
+    root_dir = cfg.get("configuration", {}).get("root", "root")
+    if not os.path.isabs(root_dir):
+        root_dir = os.path.join(os.path.dirname(config_path), root_dir)
 
-    def merge_signal_files(prefix, out_name, legend, line_color, group_name):
-        signal_files = [
-            fname
-            for fname, info in merged.get("files", {}).items()
-            if info.get("type") == "signal" and fname.startswith(prefix)
-        ]
-        if not signal_files:
-            return
+    categories = detect_categories(cfg.get("plots", {}).keys())
 
-        def add_hist(name, obj, sums_map):
-            if name not in sums_map:
-                sums_map[name] = obj.Clone(name)
-                sums_map[name].SetName(name)
-                sums_map[name].SetDirectory(0)
-            else:
-                sums_map[name].Add(obj)
-
-        sums = {}
-        for fname in signal_files:
-            path = os.path.join(ROOT_DIR, fname)
-            if not os.path.exists(path):
-                raise FileNotFoundError(f"Missing ROOT file: {path}")
-            in_file = ROOT.TFile.Open(path, "READ")
-            if not in_file or in_file.IsZombie():
-                raise RuntimeError(f"Failed to open ROOT file: {path}")
-            for key in in_file.GetListOfKeys():
-                key_name = key.GetName()
-                obj = key.ReadObj()
-                if not obj:
-                    continue
-                if obj.InheritsFrom("TH1"):
-                    add_hist(key_name, obj, sums)
-                elif obj.InheritsFrom("TDirectory"):
-                    for subkey in obj.GetListOfKeys():
-                        sub_name = subkey.GetName()
-                        sub_obj = subkey.ReadObj()
-                        if sub_obj and sub_obj.InheritsFrom("TH1"):
-                            add_hist(sub_name, sub_obj, sums)
-            in_file.Close()
-
-        out_path = os.path.join(ROOT_DIR, out_name)
-        if os.path.exists(out_path):
-            os.remove(out_path)
-        out_file = ROOT.TFile.Open(out_path, "RECREATE")
-        if not out_file or out_file.IsZombie():
-            raise RuntimeError(f"Failed to create ROOT file: {out_path}")
-        out_file.cd()
-        for hist in sums.values():
-            hist.Write()
-        out_file.Write()
-        out_file.Close()
-
-        check_file = ROOT.TFile.Open(out_path, "READ")
-        if not check_file or check_file.IsZombie():
-            raise RuntimeError(f"Failed to re-open ROOT file: {out_path}")
-        written = check_file.GetListOfKeys().GetSize()
-        check_file.Close()
-        if written != len(sums):
-            raise RuntimeError(
-                f"Merged ROOT file {out_path} has {written} histograms, expected {len(sums)}"
-            )
-
-        for fname in signal_files:
-            merged["files"].pop(fname, None)
-
-        merged["files"][out_name] = {
-            "cross-section": 1.0 / total_lumi,
-            "era": target_era,
-            "generated-events": 1.0,
-            "group": group_name,
-            "legend": legend,
-            "line-color": line_color,
-            "type": "signal",
-        }
-
-    merge_signal_files(
-        GGF_PREFIX,
-        f"HH_ggf_{target_era}.root",
-        "HH_{ggf}^{kappa_lambda=1}->bbWW",
-        3,
-        "HH_ggf",
-    )
-    merge_signal_files(
-        VBF_PREFIX,
-        f"HH_vbf_{target_era}.root",
-        "HH_{vbf}->bbWW",
-        6,
-        "HH_vbf",
-    )
-
-    merged.setdefault("groups", {})
-    merged["groups"].update({
-        "HH_ggf": {
-            "legend": "HH_{ggf}^{kappa_lambda=1}->bbWW",
-            "line-color": 1,
-        },
-        "HH_vbf": {
-            "legend": "HH_{vbf}->bbWW",
-            "line-color": 2,
-        },
-    })
-
-    DEFAULT_RATIO_RANGE = list(merged.get("plotdefaults", {}).get("ratio-y-axis-range", [0.5, 1.5]))
-    for plot_cfg in merged.get("plots", {}).values():
-        plot_cfg["era"] = target_era
-        plot_cfg["ratio-y-axis-range"] = DEFAULT_RATIO_RANGE
-        strip_blinding(plot_cfg)
-
-    global COMBINED_TOTAL_WIDTH
+    global COMBINED_TOTAL_WIDTH, COMBINED_BOUNDARIES
     COMBINED_TOTAL_WIDTH = None
-    for root_fname in list(merged.get("files", {}).keys()):
-        build_combined_hist(os.path.join(ROOT_DIR, root_fname))
+    COMBINED_BOUNDARIES = None
+    for root_fname in list(cfg.get("files", {}).keys()):
+        build_combined_hist(os.path.join(root_dir, root_fname), categories, COMBINED_HIST)
 
-    plots = merged.setdefault("plots", {})
-    base_plot_names = tuple(cat_name for _, cat_name in COMBINED_CATEGORIES)
+    plots = cfg.setdefault("plots", {})
+    base_plot_names = tuple(cat_name for _, cat_name in categories)
     base_plots = [plots[name] for name in base_plot_names if name in plots]
     if base_plots:
-        max_lin = max(cfg.get("y-axis-range", [0.0, 0.0])[1] for cfg in base_plots if "y-axis-range" in cfg)
-        max_log = max(cfg.get("log-y-axis-range", [0.0, 0.0])[1] for cfg in base_plots if "log-y-axis-range" in cfg)
+        max_lin = max(
+            cfg_plot.get("y-axis-range", [0.0, 0.0])[1]
+            for cfg_plot in base_plots
+            if "y-axis-range" in cfg_plot
+        )
+        max_log = max(
+            cfg_plot.get("log-y-axis-range", [0.0, 0.0])[1]
+            for cfg_plot in base_plots
+            if "log-y-axis-range" in cfg_plot
+        )
         combined_cfg = dict(base_plots[0])
         combined_cfg.pop("blinded-range", None)
         strip_blinding(combined_cfg)
-        combined_cfg["x-axis"] = "DL score (resolved1b | resolved2b | boosted)"
+        labels_str = " | ".join(label for label, _ in categories)
+        combined_cfg["x-axis"] = ""
         x_max = COMBINED_TOTAL_WIDTH if COMBINED_TOTAL_WIDTH is not None else 3.0
         combined_cfg["x-axis-range"] = [0.0, x_max]
         combined_cfg["show-overflow"] = False
-        combined_cfg["x-axis-label-size"] = 0
-        combined_cfg["x-axis-hide-ticks"] = True
-        combined_cfg["y-axis-range"] = [0.0, max_lin]
-        combined_cfg["ratio-y-axis-range"] = [0.5, 1.5]
-        combined_cfg["log-y-axis-range"] = [0.01, max_log]
+        combined_cfg["x-axis-label-size"] = 0.07
+        combined_cfg["x-axis-hide-ticks"] = False
+        combined_cfg["y-axis-range"] = [0.0, Y_MAX]
+        combined_cfg["ratio-y-axis-range"] = list(
+            plotdefaults.get("ratio-y-axis-range", [0.5, 1.5])
+        )
+        combined_cfg["log-y-axis-range"] = [0.01, Y_MAX]
+        if COMBINED_BOUNDARIES:
+            combined_cfg["vertical-lines"] = [
+                {**LINE_STYLE, "value": b} for b in COMBINED_BOUNDARIES
+            ] + [
+                {**LINE_STYLE, "pad-location": "bottom", "value": b}
+                for b in COMBINED_BOUNDARIES
+            ]
+
+            # Explicit lines with y extents to cover full pad height (top and ratio pads).
+            y_min, y_max = combined_cfg.get("y-axis-range", [0.0, Y_MAX])
+            line_height_top = max(y_max, Y_MAX)
+            ratio_min, ratio_max = combined_cfg.get("ratio-y-axis-range", [0.5, 1.5])
+            line_height_ratio = ratio_max
+
+            top_lines = [
+                {"value": [[b, y_min], [b, line_height_top]], **LINE_STYLE}
+                for b in COMBINED_BOUNDARIES
+            ]
+            bottom_lines = [
+                {
+                    "pad-location": "bottom",
+                    "value": [[b, ratio_min], [b, line_height_ratio]],
+                    **LINE_STYLE,
+                }
+                for b in COMBINED_BOUNDARIES
+            ]
+
+            horizontal_line = {
+                "value": [[0.0, HLINE_Y], [x_max, HLINE_Y]],
+                **LINE_STYLE,
+            }
+
+            combined_cfg["lines"] = top_lines + bottom_lines + [horizontal_line]
         plots[COMBINED_HIST] = combined_cfg
 
     BLIND_RANGE = [0.25, 0.999]
-    for plot_cfg in merged.get("plots", {}).values():
-        plot_cfg["blinded-range"] = BLIND_RANGE
+    if ENABLE_BLINDING:
+        for plot_cfg in cfg.get("plots", {}).values():
+            plot_cfg["blinded-range"] = BLIND_RANGE
 
-    out_path = f"{PLOTIT_DIR}/plots_{target_era}_combined.yml"
+    base, ext = os.path.splitext(config_path)
+    out_path = f"{base}{_args.output_suffix}{ext}"
     with open(out_path, "w") as f:
-        yaml.safe_dump(merged, f)
+        yaml.safe_dump(cfg, f)
 
     print(
-        f"Merged plotIt config written to {out_path} with {len(merged.get('files', {}))} files and {len(merged.get('plots', {}))} plots."
+        f"Built combined plot (bin-width normalized) for {config_path} -> {out_path} "
+        f"with {len(cfg.get('plots', {}))} plots."
     )
 
 
 if __name__ == "__main__":
-    for target, eras in ERA_GROUPS.items():
-        build_merged_output(target, eras)
+    for cfg_path in (_args.config_2022, _args.config_2023):
+        process_single_config(cfg_path)
 
